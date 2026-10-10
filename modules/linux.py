@@ -1,0 +1,280 @@
+import os
+
+from pygemstones.io import file as f
+from pygemstones.system import runner as r
+from pygemstones.util import log as l
+
+import modules.common as cm
+import modules.config as c
+import modules.patch as patch
+import modules.pdfium as p
+
+
+# -----------------------------------------------------------------------------
+def run_task_build_pdfium():
+    checkout = getattr(c, "pdfium_checkout_configuration_linux", None)
+    p.get_pdfium_by_target("linux", checkout_configuration=checkout)
+
+    if getattr(c, "pdf_use_skia_linux", False):
+        skia_dir = os.path.join("build", "linux", "pdfium", "third_party", "skia")
+        if not os.path.isdir(skia_dir):
+            raise SystemExit(
+                "third_party/skia is missing. checkout_configuration=minimal "
+                "skips Skia; this build needs checkout_configuration=small."
+            )
+
+    p.install_sysroots("linux", c.targets_linux)
+
+
+# -----------------------------------------------------------------------------
+def run_task_patch():
+    l.colored("Patching files...", l.YELLOW)
+
+    # Turns the library target into a shared one.
+    if c.shared_lib_linux:
+        patch.apply_shared_library("linux")
+
+    # Removes the component build guards from the public headers.
+    if c.shared_lib_linux:
+        patch.apply_public_headers("linux")
+
+    _require_exported_pdfium()
+
+    l.ok()
+
+
+# -----------------------------------------------------------------------------
+def _require_exported_pdfium():
+    build_gn = os.path.join("build", "linux", "pdfium", "BUILD.gn")
+    header = os.path.join("build", "linux", "pdfium", "public", "fpdfview.h")
+
+    with open(build_gn, encoding="utf-8") as handle:
+        gn_text = handle.read()
+    with open(header, encoding="utf-8") as handle:
+        header_text = handle.read()
+
+    if 'shared_library("pdfium")' not in gn_text:
+        raise SystemExit(
+            'BUILD.gn is still component("pdfium"); the shared library patch did not apply'
+        )
+    if "#if defined(COMPONENT_BUILD)" in header_text:
+        raise SystemExit(
+            "public/fpdfview.h still hides FPDF_EXPORT when COMPONENT_BUILD is unset"
+        )
+    if 'visibility("default")' not in header_text:
+        raise SystemExit("public/fpdfview.h lost the default-visibility FPDF_EXPORT")
+
+
+# -----------------------------------------------------------------------------
+def run_task_build():
+    l.colored("Building libraries...", l.YELLOW)
+
+    current_dir = f.current_dir()
+
+    # Walks every configuration.
+    for config in c.configurations_linux:
+        # Walks every target.
+        for target in c.targets_linux:
+            main_dir = os.path.join(
+                "build",
+                target["target_os"],
+                "pdfium",
+                "out",
+                "{0}-{1}-{2}".format(target["target_os"], target["target_cpu"], config),
+            )
+
+            f.recreate_dir(main_dir)
+
+            os.chdir(
+                os.path.join(
+                    "build",
+                    target["target_os"],
+                    "pdfium",
+                )
+            )
+
+            # Generates the ninja files.
+            l.colored(
+                'Generating files to arch "{0}" and configuration "{1}"...'.format(
+                    target["target_cpu"], config
+                ),
+                l.YELLOW,
+            )
+
+            args = cm.get_build_args(
+                config,
+                c.shared_lib_linux,
+                target["pdfium_os"],
+                target["target_cpu"],
+            )
+
+            args_str = " ".join(args)
+
+            command = [
+                "gn",
+                "gen",
+                "out/{0}-{1}-{2}".format(
+                    target["target_os"], target["target_cpu"], config
+                ),
+                "--args='{0}'".format(args_str),
+            ]
+            r.run(" ".join(command), shell=True)
+
+            # Compiles the library.
+            l.colored(
+                'Compiling to arch "{0}" and configuration "{1}"...'.format(
+                    target["target_cpu"], config
+                ),
+                l.YELLOW,
+            )
+
+            # -v floods a Skia link log. NINJA_JOBS defaults to 2 so a 16 GB
+            # runner is less likely to die during the final link.
+            jobs = os.environ.get("NINJA_JOBS", "").strip() or "2"
+            command = [
+                "ninja",
+                "-C",
+                "out/{0}-{1}-{2}".format(
+                    target["target_os"], target["target_cpu"], config
+                ),
+                "pdfium",
+                "-j",
+                jobs,
+            ]
+            r.run(command)
+
+            os.chdir(current_dir)
+
+    l.ok()
+
+
+# -----------------------------------------------------------------------------
+def run_task_install():
+    l.colored("Installing libraries...", l.YELLOW)
+
+    # Walks every configuration.
+    for config in c.configurations_linux:
+        f.recreate_dir(os.path.join("build", "linux", config))
+        f.create_dir(os.path.join("build", "linux", config, "lib"))
+
+        # Walks every target.
+        for target in c.targets_linux:
+            source_lib_path = os.path.join(
+                "build",
+                target["target_os"],
+                "pdfium",
+                "out",
+                "{0}-{1}-{2}".format(target["target_os"], target["target_cpu"], config),
+                "libpdfium.so",
+            )
+
+            target_lib_path = os.path.join(
+                "build",
+                target["target_os"],
+                config,
+                "lib",
+                target["target_cpu"],
+                "libpdfium.so",
+            )
+
+            f.copy_file(source_lib_path, target_lib_path)
+
+            r.run(["strip", "--strip-unneeded", target_lib_path])
+
+            l.colored("File data...", l.YELLOW)
+            command = ["file", target_lib_path]
+            r.run(" ".join(command), shell=True)
+
+            l.colored("File size...", l.YELLOW)
+            command = ["ls", "-lh", target_lib_path]
+            r.run(" ".join(command), shell=True)
+
+            # Rewrites the public includes so they resolve outside the checkout.
+            source_include_path = os.path.join(
+                "build",
+                target["target_os"],
+                "pdfium",
+                "public",
+            )
+
+            headers = f.find_files(source_include_path, "*.h", True)
+
+            for header in headers:
+                f.replace_in_file(header, '#include "public/', '#include "../')
+
+        # Copies the public headers.
+        l.colored("Copying header files...", l.YELLOW)
+
+        include_dir = os.path.join("build", "linux", "pdfium", "public")
+        include_cpp_dir = os.path.join(include_dir, "cpp")
+        target_include_dir = os.path.join("build", "linux", config, "include")
+        target_include_cpp_dir = os.path.join(target_include_dir, "cpp")
+
+        f.recreate_dir(target_include_dir)
+        f.copy_files(include_dir, target_include_dir, "*.h")
+        f.copy_files(include_cpp_dir, target_include_cpp_dir, "*.h")
+
+    l.ok()
+
+
+# -----------------------------------------------------------------------------
+def run_task_test():
+    l.colored("Testing...", l.YELLOW)
+
+    current_dir = os.getcwd()
+    sample_dir = os.path.join(current_dir, "sample")
+    build_dir = os.path.join(sample_dir, "build")
+
+    # Walks every configuration.
+    for config in c.configurations_linux:
+        f.recreate_dir(build_dir)
+
+        os.chdir(build_dir)
+
+        cmake_config = config.capitalize()
+
+        # Generates the sample project.
+        command = [
+            "cmake",
+            "-DPDFIUM_CONFIG={0}".format(config),
+            "-DCMAKE_BUILD_TYPE={0}".format(cmake_config),
+            "../",
+        ]
+        r.run(command)
+
+        # Builds the sample.
+        command = ["cmake", "--build", ".", "--config", cmake_config]
+        r.run(command)
+
+        # Copies the assets the sample opens.
+        f.copy_file(
+            os.path.join(sample_dir, "assets", "f1.pdf"),
+            os.path.join(build_dir, "f1.pdf"),
+        )
+
+        # Runs the sample.
+        command = ["./sample"]
+        r.run(command)
+
+        # Returns to the starting directory.
+        os.chdir(current_dir)
+
+    l.ok()
+
+
+# -----------------------------------------------------------------------------
+def run_task_archive():
+    l.colored("Archiving...", l.YELLOW)
+
+    current_dir = f.current_dir()
+    lib_dir = os.path.join(current_dir, "build", "linux")
+    output_filename = os.path.join(current_dir, "linux.zip")
+
+    sources = [
+        (os.path.join(lib_dir, configuration), configuration)
+        for configuration in c.configurations_linux
+    ]
+
+    cm.create_archive(output_filename, sources)
+
+    l.ok()
