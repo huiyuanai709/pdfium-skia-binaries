@@ -1,6 +1,13 @@
 name: Linux Skia
 
 on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'extras/images/**'
   workflow_dispatch:
     inputs:
       runner:
