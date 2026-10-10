@@ -1,0 +1,190 @@
+name: Linux Skia
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label. Public default is ubuntu-24.04 (4 vCPU, 16 GB).'
+        required: false
+        default: 'ubuntu-24.04'
+      ninja_jobs:
+        description: 'Ninja parallelism. 2 keeps a 16 GB runner from linking itself to death.'
+        required: false
+        default: '2'
+      publish_release:
+        description: 'Publish a prerelease. Leave this off unless you mean to.'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pdfium-skia-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: linux-x64
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 360
+    env:
+      NINJA_JOBS: ${{ github.event.inputs.ninja_jobs || '2' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk when the runner is tight
+        run: |
+          set -euo pipefail
+          df -h /
+          free_gb=$(df -BG / | awk 'NR==2 {gsub(/G/,"",$4); print $4}')
+          if [ "$free_gb" -lt 40 ]; then
+            sudo rm -rf \
+              /usr/local/lib/android \
+              /usr/share/dotnet \
+              /opt/ghc \
+              /usr/local/.ghcup \
+              /usr/local/share/powershell \
+              /usr/local/share/chromium \
+              /opt/hostedtoolcache/CodeQL \
+              /usr/share/swift \
+              /opt/hostedtoolcache/go \
+              || true
+            sudo apt-get clean || true
+            df -h /
+            free_gb=$(df -BG / | awk 'NR==2 {gsub(/G/,"",$4); print $4}')
+          fi
+          echo "free disk ${free_gb}G"
+          if [ "$free_gb" -lt 25 ]; then
+            echo "need at least 25GB free after cleanup" >&2
+            exit 1
+          fi
+
+      - name: Add swap when memory is tight
+        run: |
+          set -euo pipefail
+          free -h
+          avail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+          echo "MemAvailable=${avail_kb}kB NINJA_JOBS=${NINJA_JOBS}"
+          # 12 GiB. A 16 GB runner is usually above this; an 8 GB runner is not.
+          if [ "$avail_kb" -lt 12582912 ]; then
+            if ! swapon --show | grep -q .; then
+              sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+              sudo chmod 600 /swapfile
+              sudo mkswap /swapfile
+              sudo swapon /swapfile
+            fi
+            free -h
+          fi
+
+      - name: Install System Packages
+        run: |
+          sudo apt-get -y update && \
+          sudo apt-get -y install build-essential pkg-config && \
+          sudo rm -rf /var/lib/apt/lists/* && \
+          sudo apt-get clean
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Upgrade PIP
+        run: python3 -m pip install --upgrade pip setuptools wheel
+
+      - name: Install CMake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: "3.24.0"
+
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@master
+        with:
+          version: "1.12.1"
+
+      - name: Verify
+        run: |
+          python3 --version
+          cmake --version
+          ninja --version
+
+      - name: Python requirements
+        run: python3 -m pip install -r requirements.txt --user
+
+      - name: Depot tools
+        run: python3 make.py build-depot-tools
+
+      - name: Environment
+        run: echo "$PWD/build/depot-tools" >> $GITHUB_PATH
+
+      - name: PDFium
+        run: python3 make.py build-pdfium-linux
+
+      - name: Patch
+        run: python3 make.py patch-linux
+
+      - name: Patch - Check
+        run: python3 make.py patch-linux
+
+      - name: Build
+        run: python3 make.py build-linux
+
+      - name: Install
+        run: python3 make.py install-linux
+
+      - name: Verify exports
+        run: |
+          set -euo pipefail
+          LIB=build/linux/release/lib/x64/libpdfium.so
+          test -f "$LIB"
+          nm -D "$LIB" | tee symbols.txt
+          for sym in FPDF_RenderPageSkia FPDF_InitLibraryWithConfig FPDF_RenderPageBitmap; do
+            if ! nm -D "$LIB" | grep -q " ${sym}$"; then
+              echo "missing exported symbol ${sym}" >&2
+              exit 1
+            fi
+          done
+          cp "$LIB" libpdfium.so
+          sha256sum libpdfium.so | tee libpdfium.so.sha256
+          ls -lh libpdfium.so
+
+      - name: Save libpdfium.so
+        uses: actions/upload-artifact@v4
+        with:
+          name: libpdfium-skia-linux-x64
+          path: |
+            libpdfium.so
+            libpdfium.so.sha256
+            symbols.txt
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Archive
+        run: python3 make.py archive-linux
+
+      - name: Save linux.zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-zip
+          path: linux.zip
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Test sample
+        continue-on-error: true
+        run: python3 make.py test-linux
+
+      - name: Publish prerelease
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=pdfium-skia-linux-x64-chromium-8066
+          gh release create "$tag" libpdfium.so libpdfium.so.sha256 symbols.txt \
+            --repo "${{ github.repository }}" \
+            --prerelease \
+            --title "libpdfium.so linux-x64 chromium/8066 (Skia+AGG)" \
+            --notes "Drop-in linux-x64 libpdfium.so built with pdf_use_skia and pdf_use_agg. Replace the file next to MiniOcr and set MINIOCR_PDF_RENDERER=skia. CPU bitmap path, not a GPU surface."
